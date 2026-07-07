@@ -1,0 +1,123 @@
+# 릴리스 공지 자동 등록 (2026-07-07 사장님 "GitHub 올리면 저절로 공지").
+#
+# GitHub Release 를 publish 하면 license_server 에 "업데이트 안내" 공지를 자동 등록한다.
+# 수동 scripts/publish_release.py [4/4] 의 무인 자동화 버전.
+#
+# ── 중요 ──────────────────────────────────────────────────────────────────────
+# * 정본은 메인 repo(nomedcoding/maemulteoli)의 이 경로(deploy/github/announce-release.yml).
+#   실제 동작처는 **nomedcoding/maemulteoli-releases 의 .github/workflows/announce-release.yml**.
+#   릴리스 이벤트는 그 repo 에서만 발생하므로 거기에 있어야 트리거된다. 수정 시 재push 필요.
+# * title/본문 문구는 scripts/publish_release.py 의 announcement_title / build_announcement_body
+#   와 **문자 단위로 동일**해야 한다 — title 이 서버 upsert 의 멱등 키라, 수동 스크립트와
+#   Action 이 겹쳐 실행돼도 공지 1개로 수렴한다. 한쪽을 바꾸면 반드시 다른 쪽도 같이.
+# * 이 Action 실패는 릴리스·자동업뎃(electron-updater/latest.yml)과 **완전 분리** — 공지만
+#   누락된다. 실패 시 Actions 탭 Re-run 또는 로컬 publish_release.py 공지 단계로 복구.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: 릴리스 공지 자동 등록
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '버전 (예: 0.1.5 — v 없이)'
+        required: true
+      prev_version:
+        description: '직전 버전(max_version). 비우면 이전 릴리스에서 자동 계산'
+        required: false
+      publish:
+        description: '실제 발행(true) / 드래프트 테스트(false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read   # gh api 로 이전 릴리스 목록 조회.
+
+jobs:
+  announce:
+    # draft·prerelease 는 스킵. edited 는 draft 편집에도 발화하므로 가드 필수(dispatch 는 항상 실행).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.release.draft == false && github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    env:
+      SERVER_URL: https://api.maemulteoli.kr
+      ADMIN_USER: ${{ secrets.MAEMUL_ADMIN_USER }}
+      ADMIN_PASSWORD: ${{ secrets.MAEMUL_ADMIN_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+      # release.body / tag 를 run 스크립트에 ${{ }} 로 직접 보간하지 않는다(script injection 방지).
+      # 반드시 env 로만 넘기고 셸 변수로 사용한다.
+      EV_TAG: ${{ github.event.release.tag_name }}
+      EV_BODY: ${{ github.event.release.body }}
+      IN_VERSION: ${{ github.event.inputs.version }}
+      IN_PREV: ${{ github.event.inputs.prev_version }}
+      IN_PUBLISH: ${{ github.event.inputs.publish }}
+    steps:
+      - name: 공지 등록
+        run: |
+          set -euo pipefail   # set -x 금지(비번 노출 방지)
+
+          # 1) 버전 결정 — dispatch 입력 우선, 아니면 릴리스 태그에서 'v' 제거.
+          if [ -n "${IN_VERSION:-}" ]; then VERSION="${IN_VERSION#v}"; else VERSION="${EV_TAG#v}"; fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::버전이 semver 가 아님: '$VERSION' — max_version 오염(서버 fail-open) 방지 위해 중단"
+            exit 1
+          fi
+
+          # 2) 직전 버전(max_version) — dispatch 입력 우선, 아니면 이전 published 릴리스 중
+          #    현재보다 작은 최대 semver. patch-1 산술은 0.2.0 같은 minor bump 에서 틀리므로
+          #    릴리스 이력을 정답 데이터로 쓴다(publish_release.py 무인 자동화 대응).
+          PREV="${IN_PREV:-}"
+          if [ -z "$PREV" ]; then
+            ALL="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+                     --jq '.[] | select(.draft==false and .prerelease==false) | .tag_name' \
+                   | sed 's/^v//' \
+                   | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                   | grep -vx "$VERSION" || true)"
+            # 현재 버전을 끼워 정렬한 뒤 바로 앞 항목 = 현재보다 작은 최대(=직전).
+            PREV="$(printf '%s\n%s\n' "$ALL" "$VERSION" | sort -V -u \
+                    | awk -v v="$VERSION" '$0==v{print prev; exit} {prev=$0}')"
+          fi
+          if [ -z "$PREV" ]; then
+            echo "직전 릴리스가 없음(최초 릴리스로 판단) → 공지 스킵."
+            echo "이유: max_version 없이 발행하면 신버전 사용자에게도 노출돼 타겟팅이 무력화된다."
+            exit 0
+          fi
+
+          # 3) 본문 — 고정 헤더 + (릴리스 노트 있으면) 구분선 + 노트. publish_release.py 와 동일.
+          HEADER="$(printf '새 버전 v%s 이(가) 나왔습니다.\n\n앱을 완전히 껐다 다시 켜면 자동 업데이트 안내 창이 뜹니다 — '\''지금 업데이트'\''를 누르면 다운로드 후 새 버전이 자동 설치됩니다. 안내 창이 뜨지 않을 때만 maemulteoli.kr/download 에서 직접 내려받아 설치해 주세요.' "$VERSION")"
+          NOTES="${EV_BODY:-}"
+          if [ -n "$NOTES" ]; then
+            BODY="$(printf '%s\n\n---\n\n%s' "$HEADER" "$NOTES")"
+          else
+            BODY="$HEADER"
+          fi
+          TITLE="매물털이 v${VERSION} 업데이트 안내"
+          EXPIRES="$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%S')"   # naive UTC ISO(서버 _now 규약)
+
+          # publish — release 이벤트는 항상 true, dispatch 는 입력값(기본 false=드래프트 테스트).
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            PUBLISH_BOOL="${IN_PUBLISH:-false}"
+          else
+            PUBLISH_BOOL=true
+          fi
+
+          # 4) JSON 조립은 jq --arg 로만(개행·따옴표·한글 이스케이프 자동, 수동 문자열 조립 금지).
+          JSON="$(jq -n \
+            --arg title "$TITLE" \
+            --arg body "$BODY" \
+            --arg maxv "$PREV" \
+            --arg exp "$EXPIRES" \
+            --argjson publish "$PUBLISH_BOOL" \
+            '{title:$title, body_markdown:$body, severity:"info", dismissible:true, publish:$publish, max_version:$maxv, expires_at_iso:$exp}')"
+
+          # 5) POST — upsert 라 재시도 안전. 비번은 -u 셸 변수로만(커맨드 echo 안 함).
+          echo "공지 등록 → title='${TITLE}', max_version=${PREV}, publish=${PUBLISH_BOOL}"
+          RESP="$(curl --fail-with-body --retry 3 --retry-all-errors -sS \
+            -u "$ADMIN_USER:$ADMIN_PASSWORD" \
+            -H 'Content-Type: application/json' \
+            -d "$JSON" \
+            "$SERVER_URL/admin/api/announcements")"
+          echo "서버 응답: $RESP"
