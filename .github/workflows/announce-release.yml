@@ -12,6 +12,8 @@
 #   Action 이 겹쳐 실행돼도 공지 1개로 수렴한다. 한쪽을 바꾸면 반드시 다른 쪽도 같이.
 # * 이 Action 실패는 릴리스·자동업뎃(electron-updater/latest.yml)과 **완전 분리** — 공지만
 #   누락된다. 실패 시 Actions 탭 Re-run 또는 로컬 publish_release.py 공지 단계로 복구.
+# * 릴리스 1건당 이 워크플로가 3~4번 도는 건 정상(아래 concurrency 주석). 그중 'cancelled'
+#   1~2건도 정상 — 공지 누락이 아니라 GitHub 이 대기 중인 중복 실행을 접은 것.
 # ──────────────────────────────────────────────────────────────────────────────
 
 name: 릴리스 공지 자동 등록
@@ -31,6 +33,24 @@ on:
         description: '실제 발행(true) / 드래프트 테스트(false)'
         required: false
         default: 'false'
+
+# ── 같은 릴리스의 실행 직렬화(2026-09-21 v0.1.20 중복 공지 실사고) ──────────────────────
+# electron-builder 가 릴리스를 publish 한 직후 자산 업로드 단계에서 edited 이벤트가 2~3회 더
+# 발화한다(실측 0.1.18~0.1.20: 릴리스당 3~4회 실행, 첫 두 실행이 1초 간격). 두 실행이 동시에
+# POST 하면 서버 upsert(title 조회 → 없으면 INSERT)가 둘 다 "없음"을 보고 둘 다 INSERT →
+# 공지 2건(run 로그: id f031f8c1·41e992d0 둘 다 created:true). 0.1.19 는 우연히 안 겹쳤을 뿐.
+# * edited 트리거를 지우지 않는 이유: 본문이 release.body(릴리스 노트)를 공지에 넣고 서버
+#   upsert 가 '갱신'이라, 발행 후 노트를 고치면 공지도 따라 바뀌는 설계다. published 만 남기면
+#   그 정정 경로가 사라진다(workflow_dispatch 는 release.body 를 받지 못함).
+# * 그래서 같은 태그의 실행을 한 줄로 세운다. 진행 중인 실행은 끝까지 보낸다
+#   (cancel-in-progress: false — 이미 나간 POST 를 중간에 끊어 봤자 서버는 처리한다).
+#   대기 중 실행은 GitHub 이 최신 1개만 남기고 나머지를 취소하므로, 마지막 실행이
+#   최신 release.body 로 갱신하며 끝난다. 서버 쪽도 같은 title 의 upsert 를 잠금으로
+#   직렬화한다(admin.py create_announcement_api) — 여기가 뚫려도 DB 는 1건.
+# * 그룹 키: release 이벤트는 tag_name, dispatch 는 입력 version(릴리스 이벤트 땐 비어 있음).
+concurrency:
+  group: announce-${{ github.event.release.tag_name || inputs.version }}
+  cancel-in-progress: false
 
 permissions:
   contents: read   # gh api 로 이전 릴리스 목록 조회.
